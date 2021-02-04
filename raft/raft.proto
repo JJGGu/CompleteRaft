@@ -1,0 +1,58 @@
+syntax = "proto3";
+
+package raft;
+
+service Raft {
+  // 投票选举RPC
+  rpc RequestVote(RequestVoteArgs) returns (RequestVoteReply) {}
+  // 日志追加RPC
+  rpc AppendEntries(AppendEntriesArgs) returns (AppendEntriesReply) {}
+  // 快照RPC
+  rpc InstallSnapshot(InstallSnapshotArgs) returns (InstallSnapshotReply) {}
+}
+
+message RequestVoteArgs {
+  sint64 Term = 1;
+  int32 CandidateId = 2;
+  sint64 LastLogIndex = 3;
+  sint64 LastLogTerm = 4;
+}
+
+// 返回信息
+message RequestVoteReply {
+  sint64 Term = 1;      // 当前任期，便于candidate更新自己的任期号
+  bool VoteGranted = 2; // 是否赢得选票
+}
+
+message AppendEntriesArgs {
+  sint64 Term = 1;
+  int32 LeaderId = 2;
+  sint64 PrevLogIndex = 3; // 新日志前面的一个日志索引
+  sint64 PrevLogTerm = 4;  // 新日志前面的一个日志的任期号
+  sint64 LeaderCommit = 5; // 领导者的已知已提交的最高的日志条目的索引
+  repeated LogEntry Entries = 6; // 需要被保存的日志条目（被当做心跳使用是 则日志条目内容为空；为了提高效率可能一次性发送多个）
+}
+
+message AppendEntriesReply {
+  sint64 Term = 1;  // 返回的follower的任期，用于Leader更新自己的任期
+  bool Success = 2; // 是否追加成功
+  sint64 ConflictTerm = 3;  // 如果参数中的PrevLogTerm 与 FOLLOWER自己的LastLogTerm不匹配，则将ConflictTerm设为logs[prevLogIndex].Term，便于快速同步
+  sint64 ConflictIndex = 4; // 同上
+}
+
+message InstallSnapshotArgs {
+  sint64 Term = 1;                // leader's term
+  int32 LeaderId = 2;             // leader's id
+  sint64 LastIncludedIndex = 3;   // 已经快照的最后一个log index
+  sint64 LastIncludedTerm = 4;    // 已经快照的最后一个log term
+  bytes Data = 5;                // raw bytes of the snapshot chunk, starting at offset
+}
+
+message InstallSnapshotReply {
+  sint64 Term = 1; // 返回的follower的任期，用于Leader更新自己的任期
+}
+
+message LogEntry {
+  sint64 Term = 1;   // 当前Entry的任期
+  bytes Command = 2; // 具体要执行的指令
+}
