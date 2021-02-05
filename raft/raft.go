@@ -1,6 +1,9 @@
 package raft
 
 import (
+	"context"
+	"math"
+	"math/rand"
 	"sync"
 	"time"
 )
@@ -15,6 +18,9 @@ const (
 	ElectionTimeoutBase = 400 * time.Millisecond
 	ElectionTimeoutExtra = 100
 	RpcCallTimeout = HeartbeatTerm
+	StayTerm = -1
+	VoteNil = -1
+	TermNil = -1
 )
 
 // 选举超时定时器
@@ -33,6 +39,7 @@ type ApplyMsg struct {
 // Raft 节点
 // 每台服务器都有运行，只是根据不同的身份，接收/执行不同的RPC
 type Raft struct {
+	mu sync.RWMutex
 	// 这个节点的index（每个节点都有自己的唯一index）
 	me int32
 	// 所有节点的RPC client 用于相互之间的通信
@@ -74,4 +81,186 @@ type Raft struct {
 	networkUnreliable bool
 	// RPC server implementation
 	UnimplementedRaftServer
+}
+
+//  RequestVote RPC args：传入的Candidate相关信息
+func (rf *Raft) RequestVote(ctx context.Context, args *RequestVoteArgs) (*RequestVoteReply, error) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	// 初始化reply
+	reply := &RequestVoteReply{
+		Term: rf.currentTerm,
+		VoteGranted: false,
+	}
+	// 1. term 校验
+	// 如果candidate的term比当前服务器的节点小的话，返回初始化的reply
+	if args.Term < rf.currentTerm {
+		return reply, nil
+	}
+	// 转化状态，term同步，并将voteFor设置为-1
+	if args.Term > rf.currentTerm {
+		reply.Term = args.Term
+		rf.convertToFollower(args.Term, VoteNil)
+	}
+
+	// 2. 检查是否已经给别人投过票
+	if rf.votedFor != VoteNil && rf.votedFor != args.CandidateId {
+		return reply, nil
+	}
+
+	// 3. 检查candidate的日志与当前服务器节点最后日志任期和索引是否匹配。必须满足candidate是有最新的logIndexTerm和LogIndex的节点
+	lastIndex, lastTerm := rf.lastIndex(), rf.lastTerm()
+	// candidate最后一个日志的term小于当前节点
+	if lastTerm > args.LastLogIndex {
+		return reply, nil
+	}
+	// 任期相同，但是日志索引比当前节点小
+	if lastTerm == args.LastLogIndex && lastIndex > args.LastLogIndex {
+		return reply, nil
+	}
+	// 没有上述三种情况，则给candidate投票
+	reply.VoteGranted = true
+	rf.convertToFollower(args.Term, args.CandidateId)
+	rf.resetElectTimer()
+
+	return reply, nil
+}
+
+// AppendEntries RPC  args: 传入的Leader的日志的相关信息
+func (rf *Raft) AppendEntries(ctx context.Context, args *AppendEntriesArgs) (*AppendEntriesReply, error) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	// 初始化reply
+	reply := &AppendEntriesReply{
+		Term: rf.currentTerm,
+		Success: false,
+		ConflictIndex: 0,
+		ConflictTerm: 0,
+	}
+	// 检查Term
+	// 如果Leader的Term比当前节点的Term大，则说明Leader已经不是最新的了，直接返回默认reply
+	if args.Term < rf.currentTerm {
+		return reply,nil
+	}
+	// 如果Leader的Term比当前节点的Term大，则重置当前节点的Term
+	if args.Term > rf.currentTerm {
+		reply.Term = args.Term
+		// 调整Term
+		rf.convertToFollower(args.Term, VoteNil)
+	}
+	// 重置选举超时
+	rf.resetElectTimer()
+
+	// 如果当前节点的最后一个日志与Leader的PrevLogIndex不匹配，则需要记录该节点的最后一个logindex返回给Leader，Leader会重新发送从那个日志之后的日志
+	lastIndex := rf.lastIndex()
+	if lastIndex < args.PrevLogIndex {
+		reply.ConflictTerm = TermNil
+		reply.ConflictIndex = lastIndex + 1
+		return reply, nil
+	}
+
+	// 检查从Leader传输过来的
+	prevLogIndex := args.PrevLogIndex
+	prevLogTerm := int64(0)
+	// 如果Leader的Prevlogindex >= 当前节点的最后一个快照处的logIndex， 则将prevLogTerm置位该节点的preLogIndex处的Term
+	if prevLogIndex >= rf.lastIncludedIndex {
+		prevLogTerm = rf.getLog(prevLogIndex).Term
+	}
+	// 如果Leader的prevLogTerm与该节点处的preLogIndex处的Term不同
+	if prevLogTerm != args.PrevLogTerm {
+		reply.ConflictTerm = prevLogTerm
+		// 根据term找出该节点中第一个冲突的logIndex（该LogIndex之前的日志都匹配）
+		for i, e := range rf.logs {
+			if e.Term == prevLogTerm {
+				reply.ConflictIndex = int64(i) + rf.lastIncludedIndex
+			}
+		}
+	}
+
+	// 日志追加
+	for i, e := range args.Entries {
+		// 要追加到的日志的Index
+		j := prevLogIndex + int64(1 + i)
+		if j <= lastIndex {
+			// 有相同的日志情况
+			if rf.getLog(j).Term == e.Term {
+				continue
+			}
+			// 如果出现了不匹配的日志，则将其后的删除后再替换为参数中的日志
+			rf.logs = rf.logs[:rf.subIndex(j)]
+		}
+		// 追加日志
+		rf.logs = append(rf.logs, args.Entries[i:]...)
+		//_ = rf.persistState()
+		break
+	}
+
+	// 提交Apply，通过applyCh发送提交
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = int64(math.Max(float64(args.LeaderCommit), float64(rf.lastIndex())))
+		rf.apply()
+	}
+	//rf.convertToFollower(args.Term, args.LeaderId)
+	reply.Success = true
+	return reply, nil
+}
+
+// InstallSnapshot RPC
+func (rf *Raft) InstallSnapshot(ctx context.Context, args *InstallSnapshotArgs) (*InstallSnapshotReply, error) {
+
+}
+
+func (rf *Raft) sendRPC(peer int, args interface{}, reply interface{}) bool {
+
+}
+
+// 重设选举定时器
+func (rf *Raft) resetElectTimer() {
+	rf.timer.d = randElectTime()
+	rf.timer.t.Reset(rf.timer.d)
+}
+// 生成随机超时时间
+func randElectTime() time.Duration {
+	extra := time.Duration(rand.Intn(ElectionTimeoutExtra)*5) * time.Millisecond
+	return ElectionTimeoutBase + extra
+}
+
+// 转换状态并投票 持久化
+func (rf *Raft) convertToFollower(term int64, peer int32) {
+	rf.state = FOLLOWER
+	if term != StayTerm {
+		rf.currentTerm = term
+	}
+	rf.votedFor = peer
+//	_ = rf.persistState()
+}
+
+// 将指令apply
+func (rf *Raft) apply() {
+	for rf.lastApplied < rf.commitIndex {
+		rf.lastApplied++
+		rf.applyChan <- ApplyMsg{
+			CommandValid: true,
+			Command: rf.getLog(rf.lastApplied).Command,
+			CommandIndex: rf.lastApplied,
+		}
+	}
+}
+
+
+// index of logs may be changed for snapshot
+func (rf *Raft) getLog(i int64) LogEntry {
+	return *rf.logs[i-rf.lastIncludedIndex]
+}
+
+func (rf *Raft) subIndex(i int64) int64 {
+	return i - rf.lastIncludedIndex
+}
+
+func (rf *Raft) lastIndex() int64 {
+	return rf.lastIncludedIndex + int64(len(rf.logs)) - 1
+}
+
+func (rf *Raft) lastTerm() int64 {
+	return rf.logs[len(rf.logs)-1].Term
 }
