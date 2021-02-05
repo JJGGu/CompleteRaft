@@ -71,9 +71,9 @@ type Raft struct {
 	nextIndex []int64
 	// 对于所有节点当前已经匹配的最高的log index
 	matchIndex []int64
-	// 上一次快照的位置，包含该index
+	// 被快照取代的最后的条目在日志中的索引值
 	lastIncludedIndex int64
-	// 上一次快照的term
+	// 该条目的任期号
 	lastIncludedTerm int64
 	// 网络是否断开，用于测试，false代表网络链接断开
 	networkDrop bool
@@ -207,11 +207,91 @@ func (rf *Raft) AppendEntries(ctx context.Context, args *AppendEntriesArgs) (*Ap
 
 // InstallSnapshot RPC
 func (rf *Raft) InstallSnapshot(ctx context.Context, args *InstallSnapshotArgs) (*InstallSnapshotReply, error) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	reply := &InstallSnapshotReply{
+		Term: rf.currentTerm,
+	}
 
+	// 同样的操作，检查term，重置定时器
+	if args.Term < rf.currentTerm {
+		return reply, nil
+	}
+	if args.Term > rf.currentTerm {
+		reply.Term = args.Term
+		rf.convertToFollower(args.Term, VoteNil)
+	}
+	rf.resetElectTimer()
+
+	// 如果Leader的快照的最后Index小于等于当前节点的快照的LastIndex,则直接返回
+	if args.LastIncludedIndex <= rf.lastIncludedIndex {
+		return reply, nil
+	}
+
+	// 如果leader快照位置小于当前节点的当前日志长度，则进行截取，保留之后的
+	if args.LastIncludedIndex < rf.lastIndex() {
+		rf.logs = rf.logs[args.LastIncludedIndex - rf.lastIncludedIndex:]
+	} else {
+		// 当前节点的最后的日志index比Leader的快照最后index小则丢弃自己的所有日志,使用快照的日志
+		rf.logs = []*LogEntry{}
+		rf.logs = append(rf.logs, &LogEntry{
+			Term: args.LastIncludedIndex,
+			Command: nil,
+		})
+	}
+
+	// 更新Index
+	rf.lastIncludedIndex = args.LastIncludedIndex
+	rf.lastIncludedTerm = args.LastIncludedTerm
+	//_ = rf.persistStatesAndSnapshot(args.Data)
+	rf.commitIndex = int64(math.Max(float64(rf.commitIndex), float64(args.LastIncludedIndex)))
+	rf.lastApplied = int64(math.Max(float64(rf.lastApplied), float64(args.LastIncludedIndex)))
+
+	// 发出通知
+	rf.applyChan <- ApplyMsg{
+		CommandValid: false, // false代表是snapshot
+		CommandIndex: -1,
+		Command:      args.Data,
+	}
+	return reply, nil
 }
 
+// 测试RPC
 func (rf *Raft) sendRPC(peer int, args interface{}, reply interface{}) bool {
-
+	ctx := context.Background()
+	switch args.(type) {
+	case *RequestVoteArgs:
+		args, reply := args.(*RequestVoteArgs), reply.(*RequestVoteReply)
+		resp, err := rf.peers[peer].RequestVote(ctx, args)
+		if err != nil {
+			return false
+		}
+		reply.VoteGranted = resp.VoteGranted
+		reply.Term = resp.Term
+		return true
+	case *AppendEntriesArgs:
+		args, reply := args.(*AppendEntriesArgs), reply.(*AppendEntriesReply)
+		resp, err := rf.peers[peer].AppendEntries(ctx, args)
+		if err != nil {
+			//log.Printf("[Raft] raft peer%v send AppendEntries RPC error: %s\n", rf.me, err)
+			return false
+		}
+		reply.Term = resp.Term
+		reply.Success = resp.Success
+		reply.ConflictIndex = resp.ConflictIndex
+		reply.ConflictTerm = resp.ConflictTerm
+		return true
+	case *InstallSnapshotArgs:
+		args, reply := args.(*InstallSnapshotArgs), reply.(*InstallSnapshotReply)
+		resp, err := rf.peers[peer].InstallSnapshot(ctx, args)
+		if err != nil {
+			//log.Printf("[Raft] raft peer%v send InstallSnapshot RPC error: %s\n", rf.me, err)
+			return false
+		}
+		reply.Term = resp.Term
+		return true
+	}
+	return false
 }
 
 // 重设选举定时器
