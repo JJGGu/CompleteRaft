@@ -56,3 +56,12 @@ message LogEntry {
   sint64 Term = 1;   // 当前Entry的任期
   bytes Command = 2; // 具体要执行的指令
 }
+
+// 用于持久化节点状态
+message State {
+  sint64 CurrentTerm = 1;
+  int32 VotedFor = 2;
+  sint64 LastIncludedIndex = 3;
+  sint64 LastIncludedTerm = 4;
+  repeated LogEntry Logs = 5;
+}
