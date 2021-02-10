@@ -13,18 +13,18 @@ import (
 )
 
 const (
-	LEADER = "Leader"
+	LEADER    = "Leader"
 	CANDIDATE = "Candidate"
-	FOLLOWER = "Follower"
+	FOLLOWER  = "Follower"
 	// 心跳时间
 	HeartbeatTime = 100 * time.Millisecond
 	// 选举超时时间 10ms - 500ms
-	ElectionTimeoutBase = 400 * time.Millisecond
+	ElectionTimeoutBase  = 400 * time.Millisecond
 	ElectionTimeoutExtra = 100
-	RpcCallTimeout = HeartbeatTime
-	StayTerm = -1
-	VoteNil = -1
-	TermNil = -1
+	RpcCallTimeout       = HeartbeatTime
+	StayTerm             = -1
+	VoteNil              = -1
+	TermNil              = -1
 )
 
 // 选举超时定时器
@@ -95,7 +95,7 @@ func (rf *Raft) RequestVote(ctx context.Context, args *RequestVoteArgs) (*Reques
 	defer rf.mu.Unlock()
 	// 初始化reply
 	reply := &RequestVoteReply{
-		Term: rf.currentTerm,
+		Term:        rf.currentTerm,
 		VoteGranted: false,
 	}
 	// 1. term 校验
@@ -138,15 +138,15 @@ func (rf *Raft) AppendEntries(ctx context.Context, args *AppendEntriesArgs) (*Ap
 	defer rf.mu.Unlock()
 	// 初始化reply
 	reply := &AppendEntriesReply{
-		Term: rf.currentTerm,
-		Success: false,
+		Term:          rf.currentTerm,
+		Success:       false,
 		ConflictIndex: 0,
-		ConflictTerm: 0,
+		ConflictTerm:  0,
 	}
 	// 检查Term
 	// 如果Leader的Term比当前节点的Term大，则说明Leader已经不是最新的了，直接返回默认reply
 	if args.Term < rf.currentTerm {
-		return reply,nil
+		return reply, nil
 	}
 	// 如果Leader的Term比当前节点的Term大，则重置当前节点的Term
 	if args.Term > rf.currentTerm {
@@ -186,7 +186,7 @@ func (rf *Raft) AppendEntries(ctx context.Context, args *AppendEntriesArgs) (*Ap
 	// 日志追加
 	for i, e := range args.Entries {
 		// 要追加到的日志的Index
-		j := prevLogIndex + int64(1 + i)
+		j := prevLogIndex + int64(1+i)
 		if j <= lastIndex {
 			// 有相同的日志情况
 			if rf.getLog(j).Term == e.Term {
@@ -236,12 +236,12 @@ func (rf *Raft) InstallSnapshot(ctx context.Context, args *InstallSnapshotArgs) 
 
 	// 如果leader快照位置小于当前节点的当前日志长度，则进行截取，保留之后的
 	if args.LastIncludedIndex < rf.lastIndex() {
-		rf.logs = rf.logs[args.LastIncludedIndex - rf.lastIncludedIndex:]
+		rf.logs = rf.logs[args.LastIncludedIndex-rf.lastIncludedIndex:]
 	} else {
 		// 当前节点的最后的日志index比Leader的快照最后index小则丢弃自己的所有日志,使用快照的日志
 		rf.logs = []*LogEntry{}
 		rf.logs = append(rf.logs, &LogEntry{
-			Term: args.LastIncludedIndex,
+			Term:    args.LastIncludedIndex,
 			Command: nil,
 		})
 	}
@@ -304,23 +304,23 @@ func (rf *Raft) sendRPC(peer int, args interface{}, reply interface{}) bool {
 func NewRaftPeer(me int32, persist *Persist, applyChan chan ApplyMsg, clients []RaftClient) *Raft {
 	// 初始化raft节点
 	rf := &Raft{
-		me: me,
-		mu: sync.RWMutex{},
-		state: FOLLOWER,
-		applyChan: applyChan,
-		stopped: false,
-		conditions: make([]*sync.Cond, len(clients)),
-		persist: persist,
+		me:          me,
+		mu:          sync.RWMutex{},
+		state:       FOLLOWER,
+		applyChan:   applyChan,
+		stopped:     false,
+		conditions:  make([]*sync.Cond, len(clients)),
+		persist:     persist,
 		currentTerm: 0,
-		votedFor: VoteNil,
-		logs: make([]*LogEntry, 0),
-		nextIndex: make([]int64, len(clients)),
-		matchIndex: make([]int64, len(clients)),
-		peers: clients,
+		votedFor:    VoteNil,
+		logs:        make([]*LogEntry, 0),
+		nextIndex:   make([]int64, len(clients)),
+		matchIndex:  make([]int64, len(clients)),
+		peers:       clients,
 	}
 	// 重置Logs
 	rf.logs = append(rf.logs, &LogEntry{
-		Term: 0,
+		Term:    0,
 		Command: nil,
 	})
 	// 初始化条件变量
@@ -653,8 +653,6 @@ func (rf *Raft) startInstallSnapshot(peer int) {
 	rf.nextIndex[peer] = args.LastIncludedIndex + 1
 }
 
-
-
 // 当半数Peer追加了日志，则可以commit
 func (rf *Raft) updateCommitIndex() {
 	n := len(rf.peers)
@@ -671,11 +669,13 @@ func (rf *Raft) updateCommitIndex() {
 		rf.apply()
 	}
 }
+
 // 重设选举定时器
 func (rf *Raft) resetElectTimer() {
 	rf.timer.d = randElectTime()
 	rf.timer.t.Reset(rf.timer.d)
 }
+
 // 生成随机超时时间
 func randElectTime() time.Duration {
 	extra := time.Duration(rand.Intn(ElectionTimeoutExtra)*5) * time.Millisecond
@@ -689,7 +689,7 @@ func (rf *Raft) convertToFollower(term int64, peer int32) {
 		rf.currentTerm = term
 	}
 	rf.votedFor = peer
-//	_ = rf.persistState()
+	//	_ = rf.persistState()
 }
 
 // 将指令apply
@@ -698,7 +698,7 @@ func (rf *Raft) apply() {
 		rf.lastApplied++
 		rf.applyChan <- ApplyMsg{
 			CommandValid: true,
-			Command: rf.getLog(rf.lastApplied).Command,
+			Command:      rf.getLog(rf.lastApplied).Command,
 			CommandIndex: rf.lastApplied,
 		}
 	}
@@ -742,12 +742,14 @@ func (rf *Raft) lastIndex() int64 {
 func (rf *Raft) lastTerm() int64 {
 	return rf.logs[len(rf.logs)-1].Term
 }
+
 // 检查raft是否启动以及是否是leader
 func (rf *Raft) isRunningLeader() bool {
 	rf.mu.RLock()
 	defer rf.mu.RUnlock()
 	return rf.state == LEADER && !rf.stopped
 }
+
 // 节点信息持久化 存储到持久化文件中
 func (rf *Raft) persistState() error {
 	pb := &State{
