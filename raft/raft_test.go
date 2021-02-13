@@ -6,6 +6,7 @@ import (
 	"log"
 	"math/rand"
 	"net"
+	"os"
 	"runtime"
 	"strconv"
 	"sync"
@@ -17,15 +18,77 @@ const ElectionTimeout = time.Second
 
 // 测试初始化后的正常情况下的选举
 func TestInitialElection(t *testing.T) {
-	addrList := []string{"127.0.0.1:50001", "127.0.0.1:50002", "127.0.0.1:50003"}
+	//addrList := []string{"127.0.0.1:50001", "127.0.0.1:50002", "127.0.0.1:50003"}
+	addrList := []string{"127.0.0.1:50001", "127.0.0.1:50002", "127.0.0.1:50003", "127.0.0.1:50004", "127.0.0.1:50005"}
+
 	cfg := makeConfig(t, addrList)
 	defer cfg.cleanup()
-	//defer cleanStateFile(len(addrList))
+	defer cleanStateFile(len(addrList))
 	cfg.begin("-----START TESTING------")
 	// 测试是否选举出一个LEADER
 	leader := cfg.checkOneLeader()
 	fmt.Println("LEADER_ID:", leader)
+
+	// 测试heartbeat, 经过一段时间后任期是否相同
+	time.Sleep(50 * time.Millisecond)
+	term1 := cfg.checkTerms()
+	fmt.Println("term1:", term1)
+
+	time.Sleep(5 * ElectionTimeout)
+	term2 := cfg.checkTerms()
+	fmt.Println("term2:", term2)
+
+	// 打印相关测试信息
 	cfg.end()
+}
+
+func TestReElection(t *testing.T) {
+	addrList := []string{"127.0.0.1:50001", "127.0.0.1:50002", "127.0.0.1:50003"}
+	cfg := makeConfig(t, addrList)
+	defer cfg.cleanup()
+	defer cleanStateFile(len(addrList))
+	cfg.begin("-----START TESTING------")
+
+	// 网络断开前的leader
+	leader1 := cfg.checkOneLeader()
+	fmt.Println("Leader1: " , leader1)
+
+	// 测试该leader断开连接后是否新的leader被选举出来
+	fmt.Println("LEADER断开连接")
+	cfg.disconnect(leader1)
+	leader2 := cfg.checkOneLeader()
+	fmt.Println("Leader2: ", leader2)
+
+	//原leader重新加入，不应该影响当前的leader
+	fmt.Println("LEADER重新连接")
+	cfg.connect(leader1)
+	leader3 := cfg.checkOneLeader()
+	fmt.Println("Leader3: ", leader3)
+
+	// 断开两个server后，不应该有leader被选举出来
+	fmt.Println("断开两个Server")
+	cfg.disconnect(leader3)
+	cfg.disconnect((leader3 + 1) % len(addrList))
+	time.Sleep(2 * ElectionTimeout)
+	cfg.checkNoLeader()
+
+	//如果重新加入了一个server，应该选举出一个leader
+	fmt.Println("重新加入一个")
+	cfg.connect((leader2 + 1) % len(addrList))
+	cfg.checkOneLeader()
+
+	cfg.end()
+}
+
+func TestAppendEntries(t *testing.T)  {
+	addrList := []string{"127.0.0.1:50001", "127.0.0.1:50002", "127.0.0.1:50003", "127.0.0.1:50004", "127.0.0.1:50005"}
+
+	cfg := makeConfig(t, addrList)
+	defer cfg.cleanup()
+	defer cleanStateFile(len(addrList))
+	cfg.begin("-----START TESTING------")
+
+
 }
 
 type config struct {
@@ -297,6 +360,117 @@ func (c *config) checkOneLeader() int {
 	return -1
 }
 
+// 检查是否没有leader
+func (c *config) checkNoLeader() {
+	for i := 0; i < c.n; i++ {
+		if c.connected[i] {
+			_, isLeader := c.rafts[i].GetState()
+			if isLeader {
+				c.t.Fatalf("expected no leader, but %v claims to be leader", i)
+			}
+		}
+	}
+}
+
+// 检查是否每一个raft节点的任期是否相同
+func (c *config) checkTerms() int64 {
+	term := int64(-1)
+	for i := 0; i < c.n; i++ {
+		if c.connected[i] {
+			xterm, _ := c.rafts[i].GetState()
+			if term == -1 {
+				term = xterm
+			} else if term != xterm {
+				c.t.Fatalf("servers disagree on term")
+			}
+		}
+	}
+	return term
+}
+
+func cleanStateFile(n int) {
+	for i := 0; i < n; i++ {
+		_ = os.Remove("state" + strconv.Itoa(i))
+		_ = os.Remove("state" + strconv.Itoa(i) + "_copy")
+	}
+}
+
+//检查多少个server认为一个日志committed
+func (c *config) nCommitted(index int) (int, interface{}) {
+	count := 0
+	cmd := -1
+	for i := 0; i < len(c.rafts); i++ {
+		if c.applyErr[i] != "" {
+			c.t.Fatal(c.applyErr[i])
+		}
+		// 查看对应的Peer的日志，如果存在指定index，则计数++
+		c.mu.Lock()
+		cmd1, ok := c.logs[i][index]
+		c.mu.Unlock()
+		if ok {
+			// 如果日志内容不一致，报错
+			if count > 0 && cmd != cmd1 {
+				c.t.Fatalf("committed value do not match: index %v, %v, %v\n", index, cmd, cmd1)
+			}
+			count += 1
+			cmd = cmd1
+		}
+	}
+	return count, cmd
+}
+// 执行一次完整的agreement。一开始可能会选错leader，提交失败后会进行重试，失败超过10s会结束
+//
+func (c *config) one(cmd int, expectedServers int, retry bool) int64 {
+	t0 := time.Now()
+	starts := 0
+	// 执行时间超所10秒就返回
+	for time.Since(t0).Seconds() < 10 {
+		// 尝试所有的server，可能其中之一是leader
+		index := int64(-1)
+		for si := 0; si < c.n; si++ {
+			starts = (starts + 1) % c.n
+			var rf *Raft
+			c.mu.Lock()
+			if c.connected[starts] {
+				rf = c.rafts[starts]
+			}
+			c.mu.Unlock()
+			if rf != nil {
+				// 如果是leader且提交成功了
+				index1, _, ok := rf.Submit([]byte(strconv.Itoa(cmd)))
+				if ok {
+					index = index1
+					break
+				}
+			}
+		}
+
+		if index != -1 {
+			// 如果已经有leader并提交了该cmd，等待agreement
+			t1 := time.Now()
+			for time.Since(t1).Seconds() < 2 {
+				// 寻找提交记录
+				nd, cmd1 := c.nCommitted(int(index))
+				if nd > 0 && nd >= expectedServers {
+					if cmd2, ok := cmd1.(int); ok && cmd2 == cmd {
+						// 是我们提交的command
+						return index
+					}
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+			// 是否重试
+			if retry == false {
+				log.Println(index)
+				c.t.Fatalf("one(%v) failed to reach agreement", cmd)
+			}
+		} else {
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+	c.t.Fatalf("one(%v) failed to reach agreement", cmd)
+	return -1
+}
 //  end a test -- 能够到达这里说明通过了测试，打印相关信息
 func (c *config) end() {
 	c.checkTimeout()

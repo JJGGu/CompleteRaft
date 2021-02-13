@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"errors"
 	"github.com/golang/protobuf/proto"
 	"log"
 	"math"
@@ -91,6 +92,20 @@ type Raft struct {
 
 //  RequestVote RPC args：传入的Candidate相关信息
 func (rf *Raft) RequestVote(ctx context.Context, args *RequestVoteArgs) (*RequestVoteReply, error) {
+	// 模拟网络断开，收不到消息，最终超时
+	if rf.networkDrop {
+		time.Sleep(2 * RpcCallTimeout)
+		return nil, errors.New("can not connect to the target server")
+	}
+	if rf.networkUnreliable {
+		// 网络不可靠时先延时一会
+		ms := rand.Int() % 27
+		time.Sleep(time.Duration(ms) * time.Millisecond)
+		// 以一定概率丢弃部分消息（1/10）
+		if rand.Int()%1000 < 100 {
+			return nil, errors.New("can not connect to the target server")
+		}
+	}
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	// 初始化reply
@@ -126,6 +141,7 @@ func (rf *Raft) RequestVote(ctx context.Context, args *RequestVoteArgs) (*Reques
 	}
 	// 没有上述三种情况，则给candidate投票
 	reply.VoteGranted = true
+	log.Println("[Raft]",rf.me, "投给了:", args.CandidateId, "并转变为FOLLWER")
 	rf.convertToFollower(args.Term, args.CandidateId)
 	rf.resetElectTimer()
 
@@ -134,6 +150,20 @@ func (rf *Raft) RequestVote(ctx context.Context, args *RequestVoteArgs) (*Reques
 
 // AppendEntries RPC  args: 传入的Leader的日志的相关信息
 func (rf *Raft) AppendEntries(ctx context.Context, args *AppendEntriesArgs) (*AppendEntriesReply, error) {
+	// 模拟网络断开，收不到消息，最终超时
+	if rf.networkDrop {
+		time.Sleep(2 * RpcCallTimeout)
+		return nil, errors.New("can not connect to the target server")
+	}
+	if rf.networkUnreliable {
+		// 网络不可靠时先延时一会
+		ms := rand.Int() % 27
+		time.Sleep(time.Duration(ms) * time.Millisecond)
+		// 以一定概率丢弃部分消息（1/10）
+		if rand.Int()%1000 < 100 {
+			return nil, errors.New("can not connect to the target server")
+		}
+	}
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	// 初始化reply
@@ -213,6 +243,20 @@ func (rf *Raft) AppendEntries(ctx context.Context, args *AppendEntriesArgs) (*Ap
 
 // InstallSnapshot RPC
 func (rf *Raft) InstallSnapshot(ctx context.Context, args *InstallSnapshotArgs) (*InstallSnapshotReply, error) {
+	// 模拟网络断开，收不到消息，最终超时
+	if rf.networkDrop {
+		time.Sleep(2 * RpcCallTimeout)
+		return nil, errors.New("can not connect to the target server")
+	}
+	if rf.networkUnreliable {
+		// 网络不可靠时先延时一会
+		ms := rand.Int() % 27
+		time.Sleep(time.Duration(ms) * time.Millisecond)
+		// 以一定概率丢弃部分消息（1/10）
+		if rand.Int()%1000 < 100 {
+			return nil, errors.New("can not connect to the target server")
+		}
+	}
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	reply := &InstallSnapshotReply{
@@ -264,6 +308,19 @@ func (rf *Raft) InstallSnapshot(ctx context.Context, args *InstallSnapshotArgs) 
 
 // 测试RPC
 func (rf *Raft) sendRPC(peer int, args interface{}, reply interface{}) bool {
+	if rf.networkDrop {
+		time.Sleep(2 * RpcCallTimeout)
+		return false
+	}
+	if rf.networkUnreliable {
+		// 网络不可靠时先延时一会
+		ms := rand.Int() % 27
+		time.Sleep(time.Duration(ms) * time.Millisecond)
+		// 以一定概率丢弃部分消息（1/10）
+		if rand.Int()%1000 < 100 {
+			return false
+		}
+	}
 	ctx := context.Background()
 	switch args.(type) {
 	case *RequestVoteArgs:
@@ -440,6 +497,7 @@ func (rf *Raft) run() {
 		if atomic.LoadInt32(&votes) >= majority {
 			rf.state = LEADER
 			rf.mu.Unlock()
+			log.Println("[Raft] 一共收到了选票数量：", votes + 1)
 			log.Printf("[Raft] raft peer%v become Leader successfully！\n", rf.me)
 			// 成为leader后开始给其他Peer追加日志并发出心跳，结束该选举goroutine
 			go rf.startAppendEntries()
@@ -497,7 +555,7 @@ func (rf *Raft) startAppendEntries() {
 				rf.mu.Lock()
 				// 等待心跳或新的日志到来，心跳和日志共用该RPC
 				rf.conditions[peer].Wait()
-
+				//log.Println("[Raft]",  peer, "receive heartbeat")
 				// 同步到最新的日志，如果是心跳的话就没有日志可发了
 				next := rf.nextIndex[peer]
 
@@ -702,6 +760,33 @@ func (rf *Raft) apply() {
 			CommandIndex: rf.lastApplied,
 		}
 	}
+}
+
+// submit command to logs，返回之前最新的日志index，当前term，以及是否是leader
+func (rf *Raft) Submit(command []byte) (int64, int64, bool) {
+	if !rf.isRunningLeader() {
+		return -1, -1, false
+	}
+
+	// 更新日志
+	rf.mu.Lock()
+	curTerm := rf.currentTerm
+	e := &LogEntry{Term: rf.currentTerm, Command: command}
+	rf.logs = append(rf.logs, e)
+	_ = rf.persistState()
+	last := rf.lastIndex()
+	rf.matchIndex[rf.me] = last
+	rf.nextIndex[rf.me] = last + 1
+	rf.mu.Unlock()
+
+	// 发起通知，有新的日志到来
+	for i := range rf.peers {
+		if int32(i) == rf.me {
+			continue
+		}
+		rf.conditions[i].Broadcast()
+	}
+	return last, curTerm, true
 }
 
 // 读取当前Peer的状态，返回当前term以及是否为leader
